@@ -162,7 +162,7 @@ public:
     auto it = alloc_info_.find(buf);
     if (it != alloc_info_.end() && it->second.alloc) {
       ICHECK_LT(it->second.level, scope_.size());
-      if (IsAppropriateSharedMemory(GetRef<Var>(buf))) {
+      if (IsAppropriateSharedMemory(tvm::ffi::GetRef<Var>(buf))) {
         // set into scope_.size() - 1 for aggressive memory reuse
         auto enable_aggressive_merge = enable_aggressive_merge_;
         if (enable_aggressive_merge) {
@@ -209,7 +209,7 @@ public:
       // the merged allocator can reason about their lifetime correctly.
       ICHECK_LE(it->second.level, scope_.size())
           << "Load memory in places other than store.";
-      if (IsAppropriateSharedMemory(GetRef<Var>(buf))) {
+      if (IsAppropriateSharedMemory(tvm::ffi::GetRef<Var>(buf))) {
         auto enable_aggressive_merge = enable_aggressive_merge_;
         if (enable_aggressive_merge) {
           scope_[scope_.size() - 1].touched.push_back(buf);
@@ -233,7 +233,7 @@ public:
       // emitted at the allocation level after flattening, so accept them and
       // record the touch for liveness planning.
       ICHECK_LE(it->second.level, scope_.size());
-      if (IsAppropriateSharedMemory(GetRef<Var>(buf))) {
+      if (IsAppropriateSharedMemory(tvm::ffi::GetRef<Var>(buf))) {
         auto enable_aggressive_merge = enable_aggressive_merge_;
         if (enable_aggressive_merge) {
           scope_[scope_.size() - 1].touched.push_back(buf);
@@ -358,7 +358,10 @@ private:
     if (op->op.same_as(tl::tl_gemm()) || op->op.same_as(tl::tl_gemm_sp()) ||
         op->op.same_as(tl::tma_load()) || op->op.same_as(tl::tma_store()) ||
         op->op.same_as(tl::ptx_wgmma_ss()) ||
-        op->op.same_as(tl::ptx_wgmma_rs())) {
+        op->op.same_as(tl::ptx_wgmma_rs()) ||
+        op->op.same_as(builtin::ptx_mma()) ||
+        op->op.same_as(builtin::ptx_mma_sp())) {
+      LOG(INFO) << "Found intrinsic call: " << op->op;
       // These intrinsics introduce stricter SMEM alignment requirements; mark
       // the subtree.
       under_alignment_scope_ = true;
@@ -372,7 +375,7 @@ private:
   void VisitExpr_(const VarNode *op) {
     auto ptr_type = op->type_annotation.as<PointerTypeNode>();
     if (ptr_type && under_alignment_scope_) {
-      auto scope = GetPtrStorageScope(GetRef<Var>(op));
+      auto scope = GetPtrStorageScope(tvm::ffi::GetRef<Var>(op));
       if (scope == "shared" || scope == "shared.dyn") {
         auto target = Target::Current();
         ICHECK(target.defined()) << "Target is not defined";
@@ -571,6 +574,65 @@ private:
                     {merged_buf_var_,
                      mul(extra_offset + offset, PrimExpr(index_factor)),
                      op->args[2], op->args[3], op->args[4], op->args[5]});
+    } else if (op->op.same_as(builtin::ptx_mma()) ||
+               op->op.same_as(builtin::ptx_mma_sp())) {
+      // Handle ptx_mma-style calls that take pointer + index pairs for A, B,
+      // and C. If any pointer refers to merged shared memory, remap it to the
+      // merged buffer and add the appropriate byte offset (converted to the
+      // pointer's element count).
+      //
+      // Argument layout (ptx_mma / ptx_mma_sm70):
+      //  0..5 : meta (dtype/layouts)
+      //  6,7  : A_ptr, A_index
+      //  8,9  : B_ptr, B_index
+      // 10,11 : C_ptr, C_index
+      // 12..  : other flags
+      // Argument layout (ptx_mma_sp):
+      //  0..5 : meta (dtype/layouts)
+      //  6,7  : A_ptr, A_index
+      //  8,9  : B_ptr, B_index
+      // 10,11 : C_ptr, C_index
+      // 12..  : metadata, meta_index, sparse_selector, saturate
+
+      auto call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+      Array<PrimExpr> args = call->args;
+
+      auto get_ptr_dtype = [](const Var& v) -> DataType {
+        if (const auto* pty = v->type_annotation.as<PointerTypeNode>()) {
+          if (const auto* prim = pty->element_type.as<PrimTypeNode>()) {
+            return prim->dtype;
+          }
+        }
+        // Fallback to byte-addressing if element type is unknown
+        return DataType::UInt(8);
+      };
+
+      auto rewrite_ptr_and_index = [&](int ptr_pos, int idx_pos) {
+        if (ptr_pos >= static_cast<int>(args.size()) ||
+            idx_pos >= static_cast<int>(args.size())) {
+          return;
+        }
+        if (const auto* v = args[ptr_pos].as<VarNode>()) {
+          Var var = tvm::ffi::GetRef<Var>(v);
+          if (IsAppropriateSharedMemory(var)) {
+            DataType elem_dtype = get_ptr_dtype(var);
+            PrimExpr extra_offset = GetBufferOffset(var, elem_dtype);
+            PrimExpr old_index = args[idx_pos];
+            // Remap pointer to merged buffer and add element-wise offset
+            args.Set(ptr_pos, merged_buf_var_);
+            args.Set(idx_pos, old_index + extra_offset);
+          }
+        }
+      };
+
+      // A_ptr/A_index
+      rewrite_ptr_and_index(6, 7);
+      // B_ptr/B_index
+      rewrite_ptr_and_index(8, 9);
+      // C_ptr/C_index (rarely shared, but safe to handle conditionally)
+      rewrite_ptr_and_index(10, 11);
+
+      return Call(call->dtype, call->op, args);
     } else {
       return StmtExprMutator::VisitExpr_(op);
     }
@@ -1343,11 +1405,11 @@ Pass MergeSharedMemoryAllocations(bool enable_aggressive_merge = false,
                             {});
 }
 
-TVM_FFI_STATIC_INIT_BLOCK({
+TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("tl.transform.MergeSharedMemoryAllocations",
                         MergeSharedMemoryAllocations);
-});
+}
 
 } // namespace transform
 } // namespace tl
